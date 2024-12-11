@@ -1,10 +1,25 @@
 const express = require('express');
+const sequelize = require('./db');
 const app = express();
 const axios = require('axios');
 const dotenv = require('dotenv');
 const jwt = require("jsonwebtoken");
 
 dotenv.config();
+
+app.use(express.json());
+
+app.use(express.urlencoded({ extended: true }));
+
+sequelize.authenticate()
+  .then(() => {
+    console.log('Conexión exitosa a la base de datos.');
+  })
+  .catch((err) => {
+    console.error('No se pudo conectar a la base de datos:', err);
+  });
+
+const { WEBHOOK_VERIFY_TOKEN, PORT } = process.env;
 
 app.get('/facebook-conversations', async function(req, res) {
     try{
@@ -86,8 +101,61 @@ app.get('/user-information', async function (req, res) {
   }
 });
 
+app.post("/webhook/:channelId", async (req, res) => {
+  
+  try{
+  const message = req.body.entry?.[0]?.changes[0]?.value?.messages?.[0];
+
+  if (message?.type === "text") {
+      const dateUtc = new Date(message.timestamp * 1000);
+      
+      const options = {
+        timeZone: 'America/Guatemala',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      };
+      
+      const dateInGmtMinus6 = new Intl.DateTimeFormat('es-CR', options).format(dateUtc);
+
+      console.log("---------- Has recibido un mensaje nuevo a las "+dateInGmtMinus6);
+      console.log("De: "+message.from);
+      console.log("Mensaje: "+message.text.body);
+  }
+  
+}
+catch(error){
+
+}
+
+  res.sendStatus(200);
+});
+
+app.get("/webhook/:channelId", async (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  
+  const [channel, metadatos] = await sequelize.query('SELECT * FROM channel WHERE id = :id', {
+    replacements: { id: req.params.channelId },
+    type: sequelize.QueryTypes.SELECT
+  });
+
+  const data = JSON.parse(channel.omnichannel_w);
+
+  if (mode === "subscribe" && token === data.webhook_token) {
+    res.status(200).send(challenge);
+    console.log("Webhook verified successfully!");
+  } else {
+    res.sendStatus(403);
+  }
+});
+
 async function get_page_access(user, pageId, access_token) {
-    
     const accounts = await axios.get(`https://graph.facebook.com/${user}/accounts?access_token=${access_token}`);
 
     let page = null;
