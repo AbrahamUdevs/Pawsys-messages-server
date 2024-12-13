@@ -4,12 +4,18 @@ const app = express();
 const axios = require('axios');
 const dotenv = require('dotenv');
 const jwt = require("jsonwebtoken");
-
+const WebSocket = require('ws');
+const { Json } = require('sequelize/lib/utils');
 dotenv.config();
 
 app.use(express.json());
 
 app.use(express.urlencoded({ extended: true }));
+
+var conn = new WebSocket(`ws://${process.env.PAWSY_WEBSOCKET_SERVER}`);
+conn.onopen = function(e) {
+  console.log('Conexión exitosa con el websocket.');
+}
 
 sequelize.authenticate()
   .then(() => {
@@ -121,10 +127,17 @@ app.post("/webhook/:channelId", async (req, res) => {
       };
       
       const dateInGmtMinus6 = new Intl.DateTimeFormat('es-CR', options).format(dateUtc);
+    
+      conn.send(JSON.stringify({ "type": "message", "message": message.text.body, "channelId": req.params.channelId}));
+      /*const token = await axios.get(process.env.PAWSY_SERVER+"/get-csrf-token");
 
+      const resp = await axios.post(process.env.PAWSY_SERVER+"/receive-message",
+        { headers: { 'X-CSRF-TOKEN': token.data.csrfToken, 'Content-Type': 'application/json' } },
+        { body: message.text.body, from: message.from, date: message.timestamp, channel: req.params.channelId }
+      );
       console.log("---------- Has recibido un mensaje nuevo a las "+dateInGmtMinus6);
       console.log("De: "+message.from);
-      console.log("Mensaje: "+message.text.body);
+      console.log("Mensaje: "+message.text.body);*/
   }
   
 }
