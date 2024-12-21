@@ -250,7 +250,8 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
           senderImage = senderInfo.profile_pic;
         }
         else{
-          senderName = "Facebook user "+sender;
+          let errorPlatform = req.params.platform == "f" ? "Facebook" : "Instagram";
+          senderName = errorPlatform +" user "+sender;
           senderImage = `${process.env.PAWSY_SERVER}/img/avatar/avatar.png`;
         }
         break;
