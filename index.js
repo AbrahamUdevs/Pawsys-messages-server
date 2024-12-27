@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const bodyParser = require('body-parser')
+const fs = require('fs');
+const path = require('path');
 const sequelize = require('./db');
 const app = express();
 const axios = require('axios');
@@ -13,6 +14,8 @@ dotenv.config();
 app.use(express.json());
 
 app.use(express.urlencoded({ extended: false }));
+
+app.use(express.static('public'));
 
 var conn = new WebSocket(`ws://${process.env.PAWSY_WEBSOCKET_SERVER}`);
 
@@ -94,6 +97,7 @@ app.get('/get-conversations', async function (req, res) {
           sender: conversations[i].sender,
           updated: conversations[i].updated,
           profile: profile,
+          unseen: conversations[i].messages.filter(m => m.seen === 0).length,
           lastMessage: {
             type: lastMessage.type,
             text: lastMessage.type == "text" ? lastMessage.text : "[Imagen]",
@@ -107,6 +111,8 @@ app.get('/get-conversations', async function (req, res) {
     
     convers.sort((a, b) => new Date(b.updated) - new Date(a.updated));
 
+    console.log(convers);
+
     res.send({ "status" : true, "data": convers });
   }
   catch (error){
@@ -116,11 +122,31 @@ app.get('/get-conversations', async function (req, res) {
     res.send({ "status" : false, "error": error });
   }
 });
+
+app.get('/count-unseen-messages', async function (req, res) {
+  
+  try {
+    const colConversation = mongoose.connection.collection('conversations');
+
+    let channelConversation = await colConversation.findOne({ channelId: req.query.channelId });
+
+    let totalMessages = 0;
+    channelConversation.conversations.forEach(conv => {
+      totalMessages += conv.messages.filter(m => m.seen === 0).length;
+    });
+
+    res.send({ "status" : true, "data": totalMessages });
+  } catch (error) {
+    console.log(error);
+    res.send({ "status" : false, "error": error });
+  }
+});
+
 app.get('/get-single-conversation', async function (req, res) {
 
   try {
     const colConversation = mongoose.connection.collection('conversations');
-  
+
     let channelConversation = await colConversation.findOne({ channelId: req.query.channelId, 'conversations.sender': req.query.sender, 'conversations.platform': req.query.platform }, { 'conversations.$': 1 });
   
     const conversation = channelConversation.conversations.filter(conv => conv.platform == req.query.platform && conv.sender == req.query.sender);
@@ -128,8 +154,30 @@ app.get('/get-single-conversation', async function (req, res) {
     let messages = conversation[0].messages;
     
     messages.sort((a, b) => new Date(a.time) - new Date(b.time));
+    
+    const updated_conversation = await seen_messages(req.query.channelId, req.query.sender, req.query.platform);
 
     res.send({ "status" : true, "data": messages });
+  }
+  catch (error){
+    console.log(error);
+    res.send({ "status" : false, "error": error });
+  }
+
+});
+
+app.post('/seen-messages', async function (req, res) {
+
+  try {
+    
+    const updated_conversation = await seen_messages(req.body.channelId, req.body.sender, req.body.platform);
+
+    if (updated_conversation.status) {
+      res.send({ "status" : true, "data": updated_conversation.dataRes });
+    }
+    else {
+      res.send({ "status" : false, "error": updated_conversation.err });
+    }
   }
   catch (error){
     console.log(error);
@@ -188,11 +236,12 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
   
     default:
       type = "text";
+
       if (req.body.entry?.[0].messaging?.[0].message.text == undefined) {
         type = req.body.entry?.[0].messaging?.[0].message.attachments?.[0].type;
       }
 
-      if(req.params.platform == "i" && req.body.entry?.[0].messaging?.[0].message.is_echo != undefined){
+      if(req.body.entry?.[0].messaging?.[0].message.is_echo != undefined){
         is_echo = true;
       }
       break;
@@ -206,20 +255,23 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
   let senderImage = "";
 
   if ((type == "text" || type == "image") && !is_echo) {
+
+    const uuid = uuidv4();
+
     switch (platform) {
       case "w":
         let valueW = req.body.entry?.[0]?.changes[0]?.value?.messages?.[0];
+        sender = valueW.from;
         switch (type) {
           case "text":
             message_body = valueW.text.body;
             break;
           case "image":
             let imageId = valueW.image.id;
-            file = await get_image_url(imageId, req.params.channelId);
+            file = await get_image_url(imageId, req.params.channelId, uuid, sender);
             break;
         }
         time = (valueW.timestamp * 1000).toString();
-        sender = valueW.from;
         senderName = req.body.entry?.[0]?.changes[0].value.contacts?.[0].profile.name;
         senderImage = `${process.env.PAWSY_SERVER}/img/avatar/avatar.png`;
         break;
@@ -267,8 +319,6 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
       senderName: senderName,
       senderImage: senderImage,
     }
-
-    // console.log(req.body.entry?.[0].changes?.[0].value.messages?.[0]);
     
     try{
         const dateUtc = new Date(time * 1000);
@@ -297,12 +347,13 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
         }
 
         console.log(message);
-        update_conversation(req.params.channelId, message, "c");
+        update_conversation(req.params.channelId, message, "c", uuid);
     }
     catch(error){
       console.log("Error");
     }
   }
+
   res.sendStatus(200);
 });
 
@@ -311,6 +362,9 @@ app.post("/webhook-meta-message-response", async function (req, res) {
   const data = req.body;
 
   try {
+
+    const uuid = uuidv4();
+
     switch (data.platform) {
       case "w":
         const config = { headers: { 'Authorization': `Bearer ${data.access_token}`, 'Content-Type': `application/json` } };
@@ -357,7 +411,7 @@ app.post("/webhook-meta-message-response", async function (req, res) {
 
     console.log(message);
 
-    update_conversation(data.channelId, message, "o");
+    update_conversation(data.channelId, message, "o", uuid);
     res.sendStatus(200);
   }
   catch (error) {
@@ -365,7 +419,7 @@ app.post("/webhook-meta-message-response", async function (req, res) {
   }
 });
 
-async function update_conversation(channelId, message, user) {
+async function update_conversation(channelId, message, user, uuid) {
   
   const colSender = mongoose.connection.collection('senders');
   let sender = await colSender.findOne({ id: message.sender, platform: message.platform });
@@ -390,12 +444,13 @@ async function update_conversation(channelId, message, user) {
   }
 
   const newMessage = {
-    id: uuidv4(),
+    id: uuid,
     user: user,
     text: message.msg,
     file: message.file,
     type: message.type,
     time: message.time,
+    seen: user == "o" ? 1 : 0
   }
 
   const conversationUpdated = await colConversation.updateOne({ channelId: channelId, 'conversations.sender': message.sender }, { $push: { "conversations.$.messages": newMessage }, $set: { "conversations.$.updated": Date.now() } });
@@ -404,6 +459,7 @@ async function update_conversation(channelId, message, user) {
 }
 
 app.get("/webhook-meta/:channelId/:platform", async (req, res) => {
+
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -422,6 +478,28 @@ app.get("/webhook-meta/:channelId/:platform", async (req, res) => {
     res.sendStatus(403);
   }
 });
+
+async function seen_messages(channelId, sender, platform) {
+  try {
+    const colConversation = mongoose.connection.collection('conversations');
+
+    const updated_conversation = await colConversation.updateMany({
+        channelId: channelId,
+        'conversations.sender': sender,
+        'conversations.platform': platform
+      },
+      {
+        $set: { 'conversations.$.messages.$[elem].seen': 1 }
+      },
+      {
+        arrayFilters: [{ 'elem.seen': 0 }]
+    });
+
+  return { status: true, dataRes: "Yes" }
+  } catch (error) {
+    return { status: false, err: error }
+  }
+}
 
 async function create_sender(senderId, platform) {
   const collection = mongoose.connection.collection('senders');
@@ -512,7 +590,7 @@ async function getMessagesTranslation(item, access_token) {
     return data;
   }
 
-async function get_image_url(media_id, channelId) {
+async function get_image_url(media_id, channelId, uuid, sender) {
   
   let result = "";
 
@@ -534,12 +612,33 @@ async function get_image_url(media_id, channelId) {
     
     const resp = await axios.get(`https://graph.facebook.com/v21.0/${media_id}`, config);
 
-    result = resp.data.url;
+    let url = resp.data.url;
+
+    const respFinal = await axios.get(url, { responseType: 'stream', headers: { 'Authorization': 'Bearer ' + token } });
+
+    try {
+      if (!fs.existsSync(`./public/w-images/${channelId}/${sender}`)){
+        fs.mkdirSync(`./public/w-images/${channelId}/${sender}`, { recursive: true });
+      }
+      console.log('La carpeta ha sido creada');
+    } catch (error) {
+        console.error('Error al crear la carpeta:', error);
+    }
+
+    const writer = fs.createWriteStream(`./public/w-images/${channelId}/${sender}/${uuid}.jpg`);
+
+    await new Promise((resolve, reject) => {
+      respFinal.data.pipe(writer);
+
+      writer.on('finish', resolve);
+
+      writer.on('error', reject);
+    });
   }
   catch(err){
     console.log(err);
   }
-  return result;
+  return uuid+".jpg";
 }
 
 app.listen(process.env.PORT, () => {
