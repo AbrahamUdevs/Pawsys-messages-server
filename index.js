@@ -62,19 +62,41 @@ app.get('/user-information', async function (req, res) {
 
 app.get('/get-conversations', async function (req, res) {
 
+  console.log(req.query);
+
   try {
     const colConversation = mongoose.connection.collection('conversations');
 
     let conResp = await colConversation.findOne({ channelId: req.query.channelId });
 
+    if (req.query.platform != "a") {
+      conResp = conResp.conversations.filter(conv => conv.platform == req.query.platform);
+    }
+    else{
+      conResp = conResp.conversations;
+    }
+
     let convers = [];
-    if(conResp == null){
+    if(conResp == null || conResp.length <= 0){
       conResp = [];
     }
     else {
-      const senders = mongoose.connection.collection('senders');
+      let conversFiltered = [];
 
-      const conversations = conResp.conversations;
+      if (req.query.style != "a") {
+        conResp.forEach(conv => {
+          if (conv.messages.filter(m => m.seen === 0).length > 0) {
+            conversFiltered.push(conv);
+          }
+        });
+      }
+      else {
+        conversFiltered = conResp;
+      }
+
+      const conversations = conversFiltered;
+
+      const senders = mongoose.connection.collection('senders');
 
       for (let i = 0; i < conversations.length; i++) {
       
@@ -92,6 +114,19 @@ app.get('/get-conversations', async function (req, res) {
           return obj.time > max.time ? obj : max;
         }, conversations[i].messages[0]);
 
+        let lastText = ""
+        switch (lastMessage.type) {
+          case "text":
+            lastText = lastMessage.text;
+            break;
+          case "image":
+            lastText = "[Imagen]";
+            break;
+          case "audio":
+            lastText = "[Audio]";
+            break;
+        }
+
         newConver = {
           platform: conversations[i].platform,
           sender: conversations[i].sender,
@@ -100,7 +135,7 @@ app.get('/get-conversations', async function (req, res) {
           unseen: conversations[i].messages.filter(m => m.seen === 0).length,
           lastMessage: {
             type: lastMessage.type,
-            text: lastMessage.type == "text" ? lastMessage.text : "[Imagen]",
+            text: lastText,
             file: lastMessage.file
           },
         };
@@ -117,7 +152,7 @@ app.get('/get-conversations', async function (req, res) {
   }
   catch (error){
     
-    console.log("Fallo");
+    console.log(error);
 
     res.send({ "status" : false, "error": error });
   }
@@ -251,10 +286,11 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
   let time = "";
   let sender = "";
   let file = "";
+  let fileName = "";
   let senderName = "";
   let senderImage = "";
 
-  if ((type == "text" || type == "image") && !is_echo) {
+  if ((type == "text" || type == "image" || type == "audio") && !is_echo) {
 
     const uuid = uuidv4();
 
@@ -269,6 +305,12 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
           case "image":
             let imageId = valueW.image.id;
             file = await get_image_url(imageId, req.params.channelId, uuid, sender);
+            fileName = uuid + ".jpg";
+            break;
+          case "audio":
+            let audioId = valueW.audio.id;
+            file = await get_audio_url(audioId, req.params.channelId, uuid, sender);
+            fileName = uuid + ".mp4";
             break;
         }
         time = (valueW.timestamp * 1000).toString();
@@ -284,6 +326,11 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
             break;
           case "image":
             file = value.message.attachments?.[0].payload.url;
+            fileName = uuid + ".jpg";
+            break;
+          case "audio":
+            file = value.message.attachments?.[0].payload.url;
+            fileName = uuid + ".mp4";
             break;
         }
         time = (value.timestamp).toString();
@@ -313,6 +360,7 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
       platform: platform,
       msg: message_body,
       file: file,
+      fileName: fileName,
       type: type,
       time: time,
       sender: sender,
@@ -361,6 +409,8 @@ app.post("/webhook-meta-message-response", async function (req, res) {
   
   const data = req.body;
 
+  console.log("Llegamos a la función");
+
   try {
 
     const uuid = uuidv4();
@@ -404,6 +454,7 @@ app.post("/webhook-meta-message-response", async function (req, res) {
       platform: data.platform,
       msg: data.msg,
       file: "",
+      fileName: "",
       type: data.type,
       time: Date.now().toString(),
       sender: data.sender
@@ -448,6 +499,7 @@ async function update_conversation(channelId, message, user, uuid) {
     user: user,
     text: message.msg,
     file: message.file,
+    fileName: message.fileName,
     type: message.type,
     time: message.time,
     seen: user == "o" ? 1 : 0
@@ -639,6 +691,57 @@ async function get_image_url(media_id, channelId, uuid, sender) {
     console.log(err);
   }
   return uuid+".jpg";
+}
+
+async function get_audio_url(media_id, channelId, uuid, sender) {
+  
+  let result = "";
+
+  try{
+    const [channel, metadatos] = await sequelize.query('SELECT * FROM channel WHERE id = :id', {
+      replacements: { id: channelId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const data = JSON.parse(channel["omnichannel_w"]);
+
+    const token = data.access_token;
+    
+    let config = {
+      headers: {
+        'Authorization': 'Bearer ' + token
+      }
+    }
+    
+    const resp = await axios.get(`https://graph.facebook.com/v21.0/${media_id}`, config);
+
+    let url = resp.data.url;
+
+    const respFinal = await axios.get(url, { responseType: 'stream', headers: { 'Authorization': 'Bearer ' + token } });
+
+    try {
+      if (!fs.existsSync(`./public/w-audios/${channelId}/${sender}`)){
+        fs.mkdirSync(`./public/w-audios/${channelId}/${sender}`, { recursive: true });
+      }
+      console.log('La carpeta ha sido creada');
+    } catch (error) {
+        console.error('Error al crear la carpeta:', error);
+    }
+
+    const writer = fs.createWriteStream(`./public/w-audios/${channelId}/${sender}/${uuid}.mp4`);
+
+    await new Promise((resolve, reject) => {
+      respFinal.data.pipe(writer);
+
+      writer.on('finish', resolve);
+
+      writer.on('error', reject);
+    });
+  }
+  catch(err){
+    console.log(err);
+  }
+  return uuid+".mp4";
 }
 
 app.listen(process.env.PORT, () => {
