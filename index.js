@@ -63,8 +63,6 @@ app.get('/user-information', async function (req, res) {
 
 app.get('/get-conversations', async function (req, res) {
 
-  console.log(req.query);
-
   try {
     const colConversation = mongoose.connection.collection('conversations');
 
@@ -146,8 +144,6 @@ app.get('/get-conversations', async function (req, res) {
     }
     
     convers.sort((a, b) => new Date(b.updated) - new Date(a.updated));
-
-    console.log(convers);
 
     res.send({ "status" : true, "data": convers });
   }
@@ -249,6 +245,30 @@ async function get_user_information(user, channelId, platform) {
 
     const data = msgResp.error == undefined ? msgResp.data : null;
 
+    console.log(data);
+    
+    const respFinal = await axios.get(data.profile_pic, { responseType: 'stream' });
+    
+    try {
+      if (!fs.existsSync(`./public/senders/${platform}`)){
+        fs.mkdirSync(`./public/senders/${platform}`, { recursive: true });
+      }
+    } catch (error) {
+        console.error('Error al crear la carpeta:', error);
+    }
+
+    const writer = fs.createWriteStream(`./public/senders/${platform}/${user}.png`);
+
+    await new Promise((resolve, reject) => {
+      respFinal.data.pipe(writer);
+
+      writer.on('finish', resolve);
+
+      writer.on('error', reject);
+    });
+
+    data.profile_pic = `${user}.png`;
+
     return data;
   } catch (error) {
     return null;
@@ -305,37 +325,37 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
             break;
           case "image":
             let imageId = valueW.image.id;
-            file = await get_image_url(imageId, req.params.channelId, uuid, sender);
+            file = await get_image_url(imageId, req.params.channelId, uuid, sender, platform);
             fileName = uuid + ".jpg";
             break;
           case "audio":
             let audioId = valueW.audio.id;
-            file = await get_audio_url(audioId, req.params.channelId, uuid, sender);
+            file = await get_audio_url(audioId, req.params.channelId, uuid, sender, platform);
             fileName = uuid + ".mp4";
             break;
         }
         time = (valueW.timestamp * 1000).toString();
         senderName = req.body.entry?.[0]?.changes[0].value.contacts?.[0].profile.name;
-        senderImage = `${process.env.PAWSY_SERVER}/img/avatar/avatar.png`;
+        senderImage = `/img/avatar/avatar.png`;
         break;
     
       default:
         let value = req.body.entry?.[0].messaging?.[0];
+        sender = value.sender.id;
         switch (type) {
           case "text":
             message_body = value.message.text;
             break;
           case "image":
-            file = value.message.attachments?.[0].payload.url;
+            file = await get_image_url(value.message.attachments?.[0].payload.url, req.params.channelId, uuid, sender, platform);
             fileName = uuid + ".jpg";
             break;
           case "audio":
-            file = value.message.attachments?.[0].payload.url;
+            file = await get_audio_url(value.message.attachments?.[0].payload.url, req.params.channelId, uuid, sender, platform);
             fileName = uuid + ".mp4";
             break;
         }
         time = (value.timestamp).toString();
-        sender = value.sender.id;
         senderInfo = await get_user_information(sender, req.params.channelId, req.params.platform);
 
         if(senderInfo != null){
@@ -352,7 +372,7 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
         else{
           let errorPlatform = req.params.platform == "f" ? "Facebook" : "Instagram";
           senderName = errorPlatform +" user "+sender;
-          senderImage = `${process.env.PAWSY_SERVER}/img/avatar/avatar.png`;
+          senderImage = `/img/avatar/avatar.png`;
         }
         break;
     }
@@ -395,7 +415,6 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
           }
         }
 
-        console.log(message);
         update_conversation(req.params.channelId, message, "c", uuid);
     }
     catch(error){
@@ -409,8 +428,6 @@ app.post("/webhook-meta/:channelId/:platform", async (req, res) => {
 app.post("/webhook-meta-message-response", async function (req, res) {
   
   const data = req.body;
-
-  console.log("Llegamos a la función");
 
   try {
 
@@ -447,7 +464,6 @@ app.post("/webhook-meta-message-response", async function (req, res) {
         const iBody = { recipient: { "id" : data.sender }, message : {'text' : data.msg }};
 
         const respI = await axios.post(urlI, iBody);
-        console.log(1);
         break;
     }
 
@@ -460,8 +476,6 @@ app.post("/webhook-meta-message-response", async function (req, res) {
       time: Date.now().toString(),
       sender: data.sender
     }
-
-    console.log(message);
 
     update_conversation(data.channelId, message, "o", uuid);
     res.sendStatus(200);
@@ -507,8 +521,6 @@ async function update_conversation(channelId, message, user, uuid) {
   }
 
   const conversationUpdated = await colConversation.updateOne({ channelId: channelId, 'conversations.sender': message.sender }, { $push: { "conversations.$.messages": newMessage }, $set: { "conversations.$.updated": Date.now() } });
-  
-  console.log("Conversación actualizada");
 }
 
 app.get("/webhook-meta/:channelId/:platform", async (req, res) => {
@@ -615,8 +627,6 @@ async function get_page_access(user, pageId, access_token) {
       }
     });
 
-    console.log(page)
-
     return page;
 };
 
@@ -643,42 +653,46 @@ async function getMessagesTranslation(item, access_token) {
     return data;
   }
 
-async function get_image_url(media_id, channelId, uuid, sender) {
+async function get_image_url(source_file, channelId, uuid, sender, platform) {
   
   let result = "";
 
   try{
-    const [channel, metadatos] = await sequelize.query('SELECT * FROM channel WHERE id = :id', {
-      replacements: { id: channelId },
-      type: sequelize.QueryTypes.SELECT
-    });
 
-    const data = JSON.parse(channel["omnichannel_w"]);
+    url = source_file;
+    let token = "";
+    if(platform == "w"){
+      const [channel, metadatos] = await sequelize.query('SELECT * FROM channel WHERE id = :id', {
+        replacements: { id: channelId },
+        type: sequelize.QueryTypes.SELECT
+      });
 
-    const token = data.access_token;
-    
-    let config = {
-      headers: {
-        'Authorization': 'Bearer ' + token
+      const data = JSON.parse(channel["omnichannel_"+platform]);
+
+      token = data.access_token;
+      
+      let config = {
+        headers: {
+          'Authorization': 'Bearer ' + token
+        }
       }
+      
+      const resp = await axios.get(`https://graph.facebook.com/v21.0/${source_file}`, config);
+      
+      url = resp.data.url;
     }
-    
-    const resp = await axios.get(`https://graph.facebook.com/v21.0/${media_id}`, config);
-
-    let url = resp.data.url;
 
     const respFinal = await axios.get(url, { responseType: 'stream', headers: { 'Authorization': 'Bearer ' + token } });
 
     try {
-      if (!fs.existsSync(`./public/w-images/${channelId}/${sender}`)){
-        fs.mkdirSync(`./public/w-images/${channelId}/${sender}`, { recursive: true });
+      if (!fs.existsSync(`./public/media/${platform}/images/${channelId}/${sender}`)){
+        fs.mkdirSync(`./public/media/${platform}/images/${channelId}/${sender}`, { recursive: true });
       }
-      console.log('La carpeta ha sido creada');
     } catch (error) {
         console.error('Error al crear la carpeta:', error);
     }
 
-    const writer = fs.createWriteStream(`./public/w-images/${channelId}/${sender}/${uuid}.jpg`);
+    const writer = fs.createWriteStream(`./public/media/${platform}/images/${channelId}/${sender}/${uuid}.jpg`);
 
     await new Promise((resolve, reject) => {
       respFinal.data.pipe(writer);
@@ -694,11 +708,14 @@ async function get_image_url(media_id, channelId, uuid, sender) {
   return uuid+".jpg";
 }
 
-async function get_audio_url(media_id, channelId, uuid, sender) {
+async function get_audio_url(source_file, channelId, uuid, sender, platform) {
   
   let result = "";
 
   try{
+    let token = "";
+    url = source_file;
+    if(platform == "w"){
     const [channel, metadatos] = await sequelize.query('SELECT * FROM channel WHERE id = :id', {
       replacements: { id: channelId },
       type: sequelize.QueryTypes.SELECT
@@ -706,7 +723,7 @@ async function get_audio_url(media_id, channelId, uuid, sender) {
 
     const data = JSON.parse(channel["omnichannel_w"]);
 
-    const token = data.access_token;
+    token = data.access_token;
     
     let config = {
       headers: {
@@ -714,22 +731,23 @@ async function get_audio_url(media_id, channelId, uuid, sender) {
       }
     }
     
-    const resp = await axios.get(`https://graph.facebook.com/v21.0/${media_id}`, config);
+    const resp = await axios.get(`https://graph.facebook.com/v21.0/${source_file}`, config);
 
-    let url = resp.data.url;
+    url = resp.data.url;
+  }
 
     const respFinal = await axios.get(url, { responseType: 'stream', headers: { 'Authorization': 'Bearer ' + token } });
 
     try {
-      if (!fs.existsSync(`./public/w-audios/${channelId}/${sender}`)){
-        fs.mkdirSync(`./public/w-audios/${channelId}/${sender}`, { recursive: true });
+      if (!fs.existsSync(`./public/media/${platform}/audios/${channelId}/${sender}`)){
+        fs.mkdirSync(`./public/media/${platform}/audios/${channelId}/${sender}`, { recursive: true });
       }
       console.log('La carpeta ha sido creada');
     } catch (error) {
         console.error('Error al crear la carpeta:', error);
     }
 
-    const writer = fs.createWriteStream(`./public/w-audios/${channelId}/${sender}/${uuid}.mp4`);
+    const writer = fs.createWriteStream(`./public/media/${platform}/audios/${channelId}/${sender}/${uuid}.mp4`);
 
     await new Promise((resolve, reject) => {
       respFinal.data.pipe(writer);
